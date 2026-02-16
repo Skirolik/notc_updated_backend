@@ -53,7 +53,7 @@ def notc_without_tracker(data):
     try:
         lat=float(data.get("lat"))
         lon=float(data.get("lon"))
-        df=run_sim_analytic_fixed_tilt(lat=lat,lon=lon,alpha_rear=0.3657,samples=80,fixed_tilt_3d=31.0)
+        df=run_sim_analytic_fixed_tilt(lat=lat,lon=lon,alpha_rear=0.3657,samples=80)
         print('df',df)
         return df
     except Exception as e:

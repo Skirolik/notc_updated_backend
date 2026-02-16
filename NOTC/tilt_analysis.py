@@ -257,25 +257,26 @@ def run_sim_analytic_fixed_tilt(
     lat,
     lon,
     alpha_rear,
-    fixed_tilt_3d,          # ✅ USER-PROVIDED BEST 3D TILT
     year=2024,
     months=range(1, 13),
     hours=range(9, 17),
     samples=120,
+    tilts=range(0, 61, 5),
 ):
+    import pandas as pd
     from collections import defaultdict
 
     tz = infer_timezone(lat, lon)
     mod_az = 180.0 if lat >= 0 else 0.0
 
-    # timestamps
+    # ---------------- TIMESTAMPS ----------------
     t_local = pd.DatetimeIndex(
         [pd.Timestamp(f"{year}-{m:02d}-21 {h:02d}:00", tz=tz)
          for m in months for h in hours]
     )
     t_utc = t_local.tz_convert("UTC")
 
-    # ---------------- TEMPERATURE (UNCHANGED) ----------------
+    # ---------------- TEMPERATURE ----------------
     try:
         tmy, _ = pvlib.iotools.get_pvgis_tmy(lat, lon)
         tmy_year = tmy.index[0].year
@@ -291,6 +292,37 @@ def run_sim_analytic_fixed_tilt(
 
     zen, azi, dni, dhi, ghi = site_sun_and_clearsky_batch(lat, lon, t_utc, tz)
 
+    # ============================================================
+    # STEP 1 — FIND BEST 3D TILT FOR THE YEAR (LIKE OLD VERSION)
+    # ============================================================
+    tilt_energy = {}
+
+    for tilt in tilts:
+        total_energy = 0.0
+
+        for i in range(len(t_utc)):
+            if zen[i] >= 90:
+                continue
+
+            area = make_area_matrix_fast(
+                zen[i], azi[i], tilt, mod_az, samples
+            )
+
+            illum = apply_notc_irradiacne(
+                area, dni[i], dhi[i], ghi[i], alpha_rear
+            )
+
+            out = bishop2(area, illum, float(temp_air.iloc[i]), dni[i])
+
+            total_energy += float(out.get("Pmax", 0.0))
+
+        tilt_energy[tilt] = total_energy
+
+    best_tilt_3d = max(tilt_energy, key=tilt_energy.get)
+
+    # ============================================================
+    # STEP 2 — MAIN SIMULATION USING BEST TILT
+    # ============================================================
     records = []
     monthly_sums = defaultdict(lambda: defaultdict(float))
     monthly_counts = defaultdict(int)
@@ -298,7 +330,6 @@ def run_sim_analytic_fixed_tilt(
     total_pmax_2d = 0.0
     total_pmax_3d = 0.0
 
-    # ---------------- MAIN LOOP ----------------
     for i in range(len(t_utc)):
         if zen[i] >= 90:
             continue
@@ -306,9 +337,7 @@ def run_sim_analytic_fixed_tilt(
         T_amb = float(temp_air.iloc[i])
         month = t_local[i].strftime("%b")
 
-        # =========================
-        # 2D — BEST TILT (ANALYTIC)
-        # =========================
+        # 2D analytic tilt
         best_tilt_2d = analytic_best_tilt_deg(zen[i], azi[i], mod_az)
 
         G2D = compute_2d_irradiance(
@@ -316,17 +345,18 @@ def run_sim_analytic_fixed_tilt(
             zen[i], best_tilt_2d, azi[i], mod_az,
             alpha_rear
         )
+
         out_2d = bishop_module1_performance(G2D, T_amb, dni[i], n_cells=5)
 
-        # =========================
-        # 3D — FIXED USER TILT
-        # =========================
+        # 3D using best yearly tilt
         area = make_area_matrix_fast(
-            zen[i], azi[i], fixed_tilt_3d, mod_az, samples
+            zen[i], azi[i], best_tilt_3d, mod_az, samples
         )
+
         illum = apply_notc_irradiacne(
             area, dni[i], dhi[i], ghi[i], alpha_rear
         )
+
         out_3d = bishop2(area, illum, T_amb, dni[i])
 
         pmax_2d = out_2d["Pmax_series"]
@@ -356,7 +386,7 @@ def run_sim_analytic_fixed_tilt(
             "FF_2D": out_2d["FF"],
 
             # 3D
-            "tilt_optimal_3D": fixed_tilt_3d,
+            "tilt_optimal_3D": best_tilt_3d,
             "Isc_3D": out_3d["Isc"],
             "Imp_3D": out_3d["Imp"],
             "Vmp_3D": out_3d["Vmp"],
@@ -370,21 +400,18 @@ def run_sim_analytic_fixed_tilt(
         for k, v in rec.items():
             if isinstance(v, (int, float)):
                 monthly_sums[month][k] += v
+
         monthly_counts[month] += 1
 
-    # ---------------- MONTHLY AVERAGES ----------------
-    # ---------------- MONTHLY OUTPUT (MATCH OLD CONTRACT) ----------------
+    # ---------------- MONTHLY OUTPUT ----------------
     monthly_out = {}
 
     for m, sums in monthly_sums.items():
         cnt = max(monthly_counts[m], 1)
 
         monthly_out[m] = {
-            # totals
             "Pmax_2D_monthly_total": float(sums["Pmax_2D"]),
             "Pmax_3D_monthly_total": float(sums["Pmax_3D"]),
-
-            # averages
             "Isc_2D_monthly_avg": float(sums["Isc_2D"] / cnt),
             "Isc_3D_monthly_avg": float(sums["Isc_3D"] / cnt),
             "Imp_2D_monthly_avg": float(sums["Imp_2D"] / cnt),
@@ -392,21 +419,20 @@ def run_sim_analytic_fixed_tilt(
             "Vmp_2D_monthly_avg": float(sums["Vmp_2D"] / cnt),
             "Vmp_3D_monthly_avg": float(sums["Vmp_3D"] / cnt),
             "tilt_analytic_2D_monthly_avg": float(sums["tilt_analytic_2D"] / cnt),
-            "tilt_optimal_3D_monthly_avg": fixed_tilt_3d,
+            "tilt_optimal_3D_monthly_avg": best_tilt_3d,
             "FF_2D_monthly_avg": float(sums["FF_2D"] / cnt),
             "FF_3D_monthly_avg": float(sums["FF_3D"] / cnt),
-
             "count": int(cnt),
         }
 
-    # ---------------- FINAL RETURN (EXACT OLD SHAPE) ----------------
     return {
         "status": "ok",
         "rows": len(records),
-        "data": records,  # per-timestamp (unchanged)
-        "monthly": monthly_out,  # OLD monthly schema
+        "data": records,
+        "monthly": monthly_out,
         "yearly_totals": {
             "Pmax_2D_total": float(total_pmax_2d),
             "Pmax_3D_total": float(total_pmax_3d),
         },
+        "best_3D_tilt": int(best_tilt_3d),
     }
